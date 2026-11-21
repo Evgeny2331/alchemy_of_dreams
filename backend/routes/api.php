@@ -24,6 +24,7 @@ Route::prefix('v1')->group(function () {
         Route::post('/buildings/preview', [CityController::class, 'preview']);
         Route::post('/buildings', [CityController::class, 'build']);
         Route::patch('/buildings/{building}/position', [CityController::class, 'move']);
+        Route::post('/buildings/{building}/upgrade', [CityController::class, 'upgrade']);
         Route::delete('/buildings/{building}', [CityController::class, 'demolish']);
 
         Route::post('/city/buildings', [CityController::class, 'build']);

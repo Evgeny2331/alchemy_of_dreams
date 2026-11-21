@@ -86,7 +86,7 @@ class FullGameplayJourneyTest extends TestCase
             ]);
         $syncResp->assertStatus(201)->assertJsonPath('data.fog_earned', '100.000000');
 
-        // 2. Постройка здания с Idempotency-Key (стоимость 100 fog -> остаток 250 fog)
+        // 2. Постройка здания с Idempotency-Key (стоимость 100 fog -> остаток 50 fog)
         $buildResp = $this->withToken($token)
             ->withHeaders(['Idempotency-Key' => 'e2e-build-1'])
             ->postJson('/api/v1/buildings', [
@@ -130,6 +130,83 @@ class FullGameplayJourneyTest extends TestCase
             ->assertStatus(200)
             ->assertJsonPath('data.key', 'lucid_calm');
     }
+
+    public function test_building_move_demolish_preserves_historical_count_and_upgrade_endpoint_exists(): void
+    {
+        $player = Player::create(['telegram_id' => 7102, 'first_name' => 'Architect']);
+        foreach (['fog', 'silence', 'memories', 'metaphors', 'nightmare_shards'] as $res) {
+            DB::table('player_resources')->insert([
+                'player_id' => $player->id,
+                'resource_type' => $res,
+                'balance' => $res === 'fog' ? '500.000000' : '0.000000',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+
+        $token = Str::random(64);
+        PlayerSession::create([
+            'player_id' => $player->id,
+            'token_hash' => hash('sha256', $token),
+            'expires_at' => now()->addDay(),
+            'last_used_at' => now(),
+        ]);
+
+        $t0 = CarbonImmutable::parse('2026-11-21 00:00:00', 'UTC');
+        $city = City::create([
+            'player_id' => $player->id,
+            'name' => 'Arch City',
+            'economy_calculated_at' => $t0,
+        ]);
+        $island = Island::create([
+            'city_id' => $city->id,
+            'island_index' => 0,
+            'is_unlocked' => true,
+        ]);
+        BuildingCatalog::create([
+            'building_key' => 'inkwell',
+            'category' => 'production',
+            'display_name' => 'Чернильница',
+            'is_unique' => false,
+            'is_story' => false,
+            'supports_upgrade' => true,
+            'footprint_width' => 1,
+            'footprint_height' => 1,
+            'is_active' => true,
+            'metadata' => [],
+        ]);
+
+        $buildResp = $this->withToken($token)
+            ->withHeaders(['Idempotency-Key' => 'arch-build-1'])
+            ->postJson('/api/v1/buildings', [
+                'city_id' => $city->id,
+                'island_id' => $island->id,
+                'building_key' => 'inkwell',
+                'position' => ['x' => 0, 'y' => 0],
+                'now' => $t0->toIso8601String(),
+            ])->assertStatus(201);
+
+        $buildingId = (int) $buildResp->json('data.building.id');
+
+        // Перемещение здания
+        $this->withToken($token)
+            ->withHeaders(['Idempotency-Key' => 'arch-move-1'])
+            ->patchJson("/api/v1/buildings/{$buildingId}/position", [
+                'island_id' => $island->id,
+                'position' => ['x' => 3, 'y' => 2],
+            ])->assertStatus(200);
+
+        // Снос здания без физического удаления
+        $this->withToken($token)
+            ->withHeaders(['Idempotency-Key' => 'arch-demolish-1'])
+            ->deleteJson("/api/v1/buildings/{$buildingId}", [
+                'now' => $t0->addMinutes(5)->toIso8601String(),
+            ])->assertStatus(200);
+
+        $historicalCount = DB::table('buildings')
+            ->where('city_id', $city->id)
+            ->where('building_type', 'inkwell')
+            ->count();
+        $this->assertSame(1, $historicalCount);
+    }
 }
-
-

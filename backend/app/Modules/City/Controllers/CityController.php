@@ -24,12 +24,26 @@ class CityController extends Controller
         private readonly IdempotencyService $idempotencyService
     ) {}
 
+    private function errorResponse(string $code, string $message, int $status, array $details = []): JsonResponse
+    {
+        return response()->json([
+            'error' => [
+                'code' => $code,
+                'message' => $message,
+                'details' => $details,
+            ],
+            'meta' => [
+                'request_id' => (string) Str::uuid(),
+            ],
+        ], $status);
+    }
+
     public function state(Request $request): JsonResponse
     {
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->errorResponse('UNAUTHORIZED', 'Unauthorized.', 401);
         }
 
         /** @var City|null $city */
@@ -86,7 +100,7 @@ class CityController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->errorResponse('UNAUTHORIZED', 'Unauthorized.', 401);
         }
 
         $validated = $request->validate([
@@ -106,11 +120,11 @@ class CityController extends Controller
             : City::query()->where('player_id', $sessionPlayer->id)->first();
 
         if ($city === null) {
-            return response()->json(['message' => 'City not found.'], 404);
+            return $this->errorResponse('CITY_NOT_FOUND', 'City not found.', 404);
         }
 
         if ((int) $city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: city does not belong to player.'], 403);
+            return $this->errorResponse('FORBIDDEN', 'Forbidden: city does not belong to player.', 403);
         }
 
         $posX = (int) ($validated['position']['x'] ?? $validated['position_x'] ?? 0);
@@ -125,7 +139,7 @@ class CityController extends Controller
                 $posY
             );
         } catch (InvalidArgumentException $e) {
-            return response()->json(['message' => $e->getMessage()], 422);
+            return $this->errorResponse('INVALID_PLACEMENT', $e->getMessage(), 422);
         }
 
         return response()->json([
@@ -142,20 +156,18 @@ class CityController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->errorResponse('UNAUTHORIZED', 'Unauthorized.', 401);
         }
 
         $island->loadMissing('city');
         if ($island->city === null || (int) $island->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: island does not belong to player.'], 403);
+            return $this->errorResponse('FORBIDDEN', 'Forbidden: island does not belong to player.', 403);
         }
 
         try {
             $result = $this->cityService->unlockIsland($island);
         } catch (RuntimeException $e) {
-            return response()->json([
-                'message' => $e->getMessage(),
-            ], 422);
+            return $this->errorResponse('ISLAND_UNLOCK_FAILED', $e->getMessage(), 422);
         }
 
         return response()->json([
@@ -171,7 +183,7 @@ class CityController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->errorResponse('UNAUTHORIZED', 'Unauthorized.', 401);
         }
 
         $validated = $request->validate([
@@ -193,11 +205,11 @@ class CityController extends Controller
             : City::query()->where('player_id', $sessionPlayer->id)->first();
 
         if ($city === null) {
-            return response()->json(['message' => 'City not found.'], 404);
+            return $this->errorResponse('CITY_NOT_FOUND', 'City not found.', 404);
         }
 
         if ((int) $city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: city does not belong to player.'], 403);
+            return $this->errorResponse('FORBIDDEN', 'Forbidden: city does not belong to player.', 403);
         }
 
         $posX = (int) ($validated['position']['x'] ?? $validated['position_x'] ?? 0);
@@ -234,7 +246,14 @@ class CityController extends Controller
                 } catch (InvalidArgumentException|RuntimeException $e) {
                     return [
                         'status' => 422,
-                        'payload' => ['message' => $e->getMessage()],
+                        'payload' => [
+                            'error' => [
+                                'code' => 'BUILDING_BUILD_FAILED',
+                                'message' => $e->getMessage(),
+                                'details' => [],
+                            ],
+                            'meta' => ['request_id' => (string) Str::uuid()],
+                        ],
                     ];
                 }
 
@@ -255,12 +274,12 @@ class CityController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->errorResponse('UNAUTHORIZED', 'Unauthorized.', 401);
         }
 
         $building->loadMissing('city');
         if ($building->city === null || (int) $building->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: building does not belong to player.'], 403);
+            return $this->errorResponse('FORBIDDEN', 'Forbidden: building does not belong to player.', 403);
         }
 
         $validated = $request->validate([
@@ -288,7 +307,14 @@ class CityController extends Controller
                 } catch (RuntimeException $e) {
                     return [
                         'status' => 422,
-                        'payload' => ['message' => $e->getMessage()],
+                        'payload' => [
+                            'error' => [
+                                'code' => 'BUILDING_UPGRADE_FAILED',
+                                'message' => $e->getMessage(),
+                                'details' => [],
+                            ],
+                            'meta' => ['request_id' => (string) Str::uuid()],
+                        ],
                     ];
                 }
 
@@ -309,12 +335,12 @@ class CityController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->errorResponse('UNAUTHORIZED', 'Unauthorized.', 401);
         }
 
         $building->loadMissing('city');
         if ($building->city === null || (int) $building->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: building does not belong to player.'], 403);
+            return $this->errorResponse('FORBIDDEN', 'Forbidden: building does not belong to player.', 403);
         }
 
         $validated = $request->validate([
@@ -353,7 +379,14 @@ class CityController extends Controller
                 } catch (InvalidArgumentException|RuntimeException $e) {
                     return [
                         'status' => 422,
-                        'payload' => ['message' => $e->getMessage()],
+                        'payload' => [
+                            'error' => [
+                                'code' => 'BUILDING_MOVE_FAILED',
+                                'message' => $e->getMessage(),
+                                'details' => [],
+                            ],
+                            'meta' => ['request_id' => (string) Str::uuid()],
+                        ],
                     ];
                 }
 
@@ -382,15 +415,16 @@ class CityController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->errorResponse('UNAUTHORIZED', 'Unauthorized.', 401);
         }
 
         $building->loadMissing('city');
         if ($building->city === null || (int) $building->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: building does not belong to player.'], 403);
+            return $this->errorResponse('FORBIDDEN', 'Forbidden: building does not belong to player.', 403);
         }
 
         $validated = $request->validate([
+            'idempotency_key' => ['nullable', 'string', 'max:128'],
             'now' => ['nullable', 'date'],
         ]);
 
@@ -398,17 +432,46 @@ class CityController extends Controller
             ? CarbonImmutable::parse((string) $validated['now'])->utc()
             : null;
 
-        try {
-            $updated = $this->cityService->demolishBuilding($building, $now);
-        } catch (RuntimeException $e) {
-            return response()->json([
-                'message' => $e->getMessage(),
-            ], 422);
-        }
+        $idemKey = $this->idempotencyService->resolveKey($request);
 
-        return response()->json([
-            'data' => $updated,
-            'meta' => ['request_id' => (string) Str::uuid()],
-        ]);
+        return $this->idempotencyService->execute(
+            $sessionPlayer,
+            $idemKey,
+            'city_demolish_building',
+            [
+                'player_id' => $sessionPlayer->id,
+                'building_id' => $building->id,
+            ],
+            function () use ($building, $now): array {
+                try {
+                    $updated = $this->cityService->demolishBuilding($building, $now);
+                } catch (RuntimeException $e) {
+                    return [
+                        'status' => 422,
+                        'payload' => [
+                            'error' => [
+                                'code' => 'BUILDING_DEMOLISH_FAILED',
+                                'message' => $e->getMessage(),
+                                'details' => [],
+                            ],
+                            'meta' => ['request_id' => (string) Str::uuid()],
+                        ],
+                    ];
+                }
+
+                $data = is_array($updated) ? $updated : $updated->toArray();
+                $data['idempotent_replay'] = false;
+
+                return [
+                    'status' => 200,
+                    'payload' => [
+                        'data' => $data,
+                        'meta' => ['request_id' => (string) Str::uuid()],
+                    ],
+                ];
+            },
+            $now
+        );
     }
 }
+

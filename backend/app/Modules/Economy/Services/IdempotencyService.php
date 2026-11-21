@@ -7,7 +7,7 @@ use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use InvalidArgumentException;
+use Illuminate\Support\Str;
 
 class IdempotencyService
 {
@@ -65,7 +65,14 @@ class IdempotencyService
             if ($existing !== null) {
                 if ($existing->request_hash !== $requestHash) {
                     return response()->json([
-                        'message' => 'Idempotency key reused with different request payload.',
+                        'error' => [
+                            'code' => 'IDEMPOTENCY_KEY_REUSED',
+                            'message' => 'Idempotency key reused with different request payload.',
+                            'details' => [],
+                        ],
+                        'meta' => [
+                            'request_id' => (string) Str::uuid(),
+                        ],
                     ], 409);
                 }
 

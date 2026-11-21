@@ -37,19 +37,22 @@ jobs:
 
       - name: Install dependencies
         working-directory: backend
-        run: composer ci || composer install --no-interaction --prefer-dist
+        run: composer install --no-interaction --prefer-dist --no-progress
 
       - name: Run PHPUnit
         working-directory: backend
-        env:
-          APP_ENV: testing
-          DB_CONNECTION: pgsql
-          DB_HOST: 127.0.0.1
-          DB_PORT: 5432
-          DB_DATABASE: alchemy_test
-          DB_USERNAME: alchemy
-          DB_PASSWORD: secret
-          CACHE_STORE: array
-          QUEUE_CONNECTION: sync
-          SESSION_DRIVER: array
-        run: vendor/bin/phpunit
+        run: |
+          php -r '
+            $xml = file_get_contents("phpunit.xml");
+            $map = [
+              "DB_HOST" => "127.0.0.1",
+              "DB_DATABASE" => "alchemy_test",
+              "DB_USERNAME" => "alchemy",
+              "DB_PASSWORD" => "secret",
+            ];
+            foreach ($map as $k => $v) {
+              $xml = preg_replace("/(<server name=\"" . $k . "\" value=\")[^\"]*(\"\/>)/", "${1}" . $v . "${2}", $xml);
+            }
+            file_put_contents("phpunit.xml", $xml);
+          '
+          vendor/bin/phpunit

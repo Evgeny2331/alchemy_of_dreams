@@ -79,12 +79,13 @@ class AlchemyController extends Controller
                 'player_id' => $sessionPlayer->id,
                 'components' => $validated['components'],
             ],
-            function () use ($sessionPlayer, $validated, $now): array {
+            function () use ($sessionPlayer, $validated, $now, $idemKey): array {
                 try {
                     $result = $this->alchemyService->transmute(
                         $sessionPlayer,
                         $validated['components'],
-                        $now
+                        $now,
+                        $idemKey
                     );
                 } catch (InvalidArgumentException|RuntimeException $e) {
                     return [

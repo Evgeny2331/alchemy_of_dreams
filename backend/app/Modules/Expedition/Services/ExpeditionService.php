@@ -25,36 +25,25 @@ class ExpeditionService
         return $this->economyService ?? app(EconomyService::class);
     }
 
-    private const SPECS = [
-        'surface' => [
-            'duration_seconds' => 300,
-            'energy_per_resident' => 1.0,
-            'memories_min' => 5,
-            'memories_max' => 10,
-        ],
-        'deep' => [
-            'duration_seconds' => 2700,
-            'energy_per_resident' => 3.0,
-            'memories_min' => 20,
-            'memories_max' => 35,
-        ],
-    ];
+    private function getSpec(string $type): array
+    {
+        $specs = config('game_balance.expeditions', []);
+        if (!is_array($specs) || !isset($specs[$type]) || !is_array($specs[$type])) {
+            throw new InvalidArgumentException("Unsupported expedition type: {$type}");
+        }
+        return $specs[$type];
+    }
 
-    /**
-     * Запускает экспедицию для выбранных жителей города.
-     *
-     * @param  list<int>  $residentIds
-     */
     public function startExpedition(
         City $city,
         string $type,
         array $residentIds,
-        string $balanceVersion = '1.0',
-        ?CarbonImmutable $now = null
+        ?string $balanceVersion = null,
+        ?CarbonImmutable $now = null,
+        ?string $idempotencyKey = null
     ): Expedition {
-        if (!isset(self::SPECS[$type])) {
-            throw new InvalidArgumentException("Unsupported expedition type: {$type}");
-        }
+        $spec = $this->getSpec($type);
+        $economy = $this->economy();
 
         if ($residentIds === []) {
             throw new InvalidArgumentException('Expedition requires at least one resident.');
@@ -65,21 +54,41 @@ class ExpeditionService
             throw new InvalidArgumentException('Duplicate resident IDs in expedition roster.');
         }
 
-        $spec = self::SPECS[$type];
-        $energyCost = $spec['energy_per_resident'];
+        $energyCostFormatted = $economy->normalizeDecimal((string) ($spec['energy_per_resident'] ?? '1.00'), 2);
+        $energyCostScaled = $this->toScaledInt($energyCostFormatted, 2);
+        $durationSeconds = (int) ($spec['duration_seconds'] ?? 300);
         $startedAt = ($now ?? CarbonImmutable::now('UTC'))->utc();
-        $endsAt = $startedAt->addSeconds($spec['duration_seconds']);
+        $endsAt = $startedAt->addSeconds($durationSeconds);
+        $version = $balanceVersion ?? (string) config('game_balance.default_balance_version', '1.0');
+        $opKey = $idempotencyKey ?? ("expedition_start:{$city->id}:{$type}:" . $startedAt->timestamp);
+
+        $costs = [];
+        foreach (($spec['cost'] ?? []) as $resourceType => $amount) {
+            $economy->assertValidResourceType((string) $resourceType);
+            $normalizedCost = $economy->normalizeDecimal((string) $amount, 6);
+            if ($this->compareScaled($normalizedCost, '0.000000', 6) > 0) {
+                $costs[(string) $resourceType] = $normalizedCost;
+            }
+        }
 
         return DB::transaction(function () use (
             $city,
             $type,
             $uniqueIds,
-            $energyCost,
+            $energyCostFormatted,
+            $energyCostScaled,
+            $costs,
             $startedAt,
             $endsAt,
-            $balanceVersion
+            $version,
+            $opKey,
+            $economy
         ): Expedition {
-            City::query()->whereKey($city->id)->lockForUpdate()->firstOrFail();
+            /** @var City $lockedCity */
+            $lockedCity = City::query()->whereKey($city->id)->lockForUpdate()->firstOrFail();
+
+            /** @var Player $player */
+            $player = Player::query()->whereKey($lockedCity->player_id)->lockForUpdate()->firstOrFail();
 
             $residents = Resident::query()
                 ->whereIn('id', $uniqueIds)
@@ -95,21 +104,36 @@ class ExpeditionService
                 /** @var Resident $resident */
                 $resident = $residents->get($id);
 
-                if ($resident->city_id !== $city->id) {
-                    throw new InvalidArgumentException("Resident {$id} does not belong to city {$city->id}.");
+                if ((int) $resident->city_id !== (int) $lockedCity->id) {
+                    throw new InvalidArgumentException("Resident {$id} does not belong to city {$lockedCity->id}.");
                 }
 
                 if ($resident->status !== 'available') {
                     throw new RuntimeException("Resident {$id} is not available (status: {$resident->status}).");
                 }
 
-                if ((float) $resident->energy < $energyCost) {
+                $currentEnergyFormatted = $economy->normalizeDecimal((string) $resident->energy, 2);
+                $currentEnergyScaled = $this->toScaledInt($currentEnergyFormatted, 2);
+                if ($currentEnergyScaled < $energyCostScaled) {
                     throw new RuntimeException("Resident {$id} has insufficient energy.");
                 }
             }
 
+            foreach ($costs as $resourceType => $amount) {
+                $economy->applyResourceDelta(
+                    $player,
+                    $resourceType,
+                    '-' . $amount,
+                    'expedition_start',
+                    "{$opKey}:cost:{$resourceType}",
+                    'city',
+                    $lockedCity->id,
+                    $startedAt
+                );
+            }
+
             $expedition = Expedition::create([
-                'city_id' => $city->id,
+                'city_id' => $lockedCity->id,
                 'expedition_type' => $type,
                 'status' => 'active',
                 'started_at' => $startedAt,
@@ -118,16 +142,20 @@ class ExpeditionService
                 'claimed_at' => null,
                 'reward_payload' => null,
                 'outcome_seed' => random_int(1, PHP_INT_MAX),
-                'balance_version' => $balanceVersion,
+                'balance_version' => $version,
             ]);
 
             foreach ($uniqueIds as $id) {
                 /** @var Resident $resident */
                 $resident = $residents->get($id);
-                $remainingEnergy = round((float) $resident->energy - $energyCost, 2);
+                $currentEnergyScaled = $this->toScaledInt(
+                    $economy->normalizeDecimal((string) $resident->energy, 2),
+                    2
+                );
+                $remainingScaled = max(0, $currentEnergyScaled - $energyCostScaled);
 
                 $resident->update([
-                    'energy' => number_format($remainingEnergy, 2, '.', ''),
+                    'energy' => $this->fromScaledInt($remainingScaled, 2),
                     'status' => 'expedition',
                     'assigned_building_id' => null,
                 ]);
@@ -135,7 +163,7 @@ class ExpeditionService
                 ExpeditionResident::create([
                     'expedition_id' => $expedition->id,
                     'resident_id' => $resident->id,
-                    'energy_spent' => number_format($energyCost, 2, '.', ''),
+                    'energy_spent' => $energyCostFormatted,
                 ]);
             }
 
@@ -143,9 +171,6 @@ class ExpeditionService
         });
     }
 
-    /**
-     * Завершает экспедицию (если ends_at <= now) и фиксирует награду.
-     */
     public function completeExpedition(Expedition $expedition, ?CarbonImmutable $now = null): Expedition
     {
         $currentTime = ($now ?? CarbonImmutable::now('UTC'))->utc();
@@ -179,16 +204,12 @@ class ExpeditionService
         });
     }
 
-    /**
-     * Помечает награду экспедиции как полученную ровно один раз и начисляет memories через EconomyService.
-     *
-     * @return array<string, mixed>
-     */
     public function claimReward(Expedition $expedition, ?CarbonImmutable $now = null): array
     {
         $currentTime = ($now ?? CarbonImmutable::now('UTC'))->utc();
+        $economy = $this->economy();
 
-        return DB::transaction(function () use ($expedition, $currentTime): array {
+        return DB::transaction(function () use ($expedition, $currentTime, $economy): array {
             /** @var Expedition $locked */
             $locked = Expedition::query()
                 ->whereKey($expedition->id)
@@ -216,18 +237,18 @@ class ExpeditionService
             }
 
             $payload = $locked->reward_payload ?? ['memories' => '0.000000'];
-            $memoriesReward = (float) ($payload['memories'] ?? 0.0);
+            $memoriesFormatted = $economy->normalizeDecimal((string) ($payload['memories'] ?? '0.000000'), 6);
 
             /** @var City $city */
             $city = City::query()->whereKey($locked->city_id)->firstOrFail();
             /** @var Player $player */
             $player = Player::query()->whereKey($city->player_id)->firstOrFail();
 
-            if ($memoriesReward > 0) {
-                $this->economy()->applyResourceDelta(
+            if ($this->compareScaled($memoriesFormatted, '0.000000', 6) > 0) {
+                $economy->applyResourceDelta(
                     $player,
                     'memories',
-                    number_format($memoriesReward, 6, '.', ''),
+                    $memoriesFormatted,
                     'expedition_claim',
                     "expedition_claim:{$locked->id}",
                     'expedition',
@@ -274,23 +295,38 @@ class ExpeditionService
         });
     }
 
-    /**
-     * Детерминированно вычисляет полезную нагрузку награды на основе outcome_seed экспедиции.
-     *
-     * @return array{memories: string}
-     */
     private function computeRewardPayload(Expedition $expedition): array
     {
-        $spec = self::SPECS[$expedition->expedition_type] ?? self::SPECS['surface'];
+        $spec = $this->getSpec($expedition->expedition_type);
+        $min = (int) ($spec['memories_min'] ?? 5);
+        $max = (int) ($spec['memories_max'] ?? 10);
         $seed = (string) ($expedition->outcome_seed ?? $expedition->id);
         $hash = hash('sha256', $expedition->id . ':' . $seed);
-        $span = max(1, $spec['memories_max'] - $spec['memories_min'] + 1);
+        $span = max(1, $max - $min + 1);
         $offset = hexdec(substr($hash, 0, 8)) % $span;
-        $memories = $spec['memories_min'] + $offset;
+        $memories = $min + $offset;
 
         return [
-            'memories' => number_format((float) $memories, 6, '.', ''),
+            'memories' => $this->economy()->normalizeDecimal((string) $memories, 6),
         ];
     }
-}
 
+    private function compareScaled(string $a, string $b, int $scale): int
+    {
+        return $this->toScaledInt($a, $scale) <=> $this->toScaledInt($b, $scale);
+    }
+
+    private function toScaledInt(string $unsignedNormalized, int $scale): int
+    {
+        [$intPart, $fracPart] = array_pad(explode('.', $unsignedNormalized, 2), 2, '');
+        return (int) ($intPart . str_pad($fracPart, $scale, '0', STR_PAD_RIGHT));
+    }
+
+    private function fromScaledInt(int $scaled, int $scale): string
+    {
+        $factor = 10 ** $scale;
+        $intPart = intdiv($scaled, $factor);
+        $fracPart = str_pad((string) ($scaled % $factor), $scale, '0', STR_PAD_LEFT);
+        return $intPart . '.' . $fracPart;
+    }
+}

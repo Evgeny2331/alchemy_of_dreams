@@ -42,6 +42,13 @@ class EconomyAndExpeditionInvariantsTest extends TestCase
     public function test_expedition_double_claim_does_not_duplicate_rewards(): void
     {
         $player = Player::create(['telegram_id' => 8002, 'first_name' => 'ClaimGuard']);
+        DB::table('player_resources')->insert([
+            'player_id' => $player->id,
+            'resource_type' => 'fog',
+            'balance' => '50.000000',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
         $t0 = CarbonImmutable::parse('2026-11-21 00:00:00', 'UTC');
 
         $city = City::create([

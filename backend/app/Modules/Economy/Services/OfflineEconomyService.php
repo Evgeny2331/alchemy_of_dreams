@@ -14,7 +14,7 @@ use InvalidArgumentException;
 
 class OfflineEconomyService
 {
-    public const BASE_STORAGE_CAPACITY = 200.0;
+    public const BASE_STORAGE_CAPACITY = '200.000000';
 
     public function __construct(
         private readonly WorldPhaseService $worldPhaseService,
@@ -26,79 +26,81 @@ class OfflineEconomyService
         return $this->economyService ?? app(EconomyService::class);
     }
 
-    /**
-     * Вычисляет базовую скорость производства Fog в час для города
-     * как сумму fog_per_hour по всем активным зданиям (status = 'active') по их текущему уровню.
-     */
-    public function calculateCityBaseFogPerHour(City $city): float
+    public function calculateCityBaseFogPerHour(City $city): string
     {
+        $economy = $this->economy();
         if (!Schema::hasTable('buildings') || !Schema::hasTable('building_level_configs')) {
-            return 0.0;
+            return '0.000000';
         }
 
-        $sum = DB::table('buildings as b')
+        $rows = DB::table('buildings as b')
             ->join('building_level_configs as blc', function ($join): void {
                 $join->on('blc.building_catalog_id', '=', 'b.building_catalog_id')
                     ->on('blc.level', '=', 'b.level');
             })
             ->where('b.city_id', $city->id)
             ->where('b.status', 'active')
-            ->sum('blc.fog_per_hour');
+            ->pluck('blc.fog_per_hour');
 
-        return round(max(0.0, (float) $sum), 6);
+        $totalScaled = 0;
+        foreach ($rows as $val) {
+            $norm = $economy->normalizeDecimal((string) $val, 6);
+            if (!str_starts_with($norm, '-')) {
+                $totalScaled += $this->toScaledInt($norm, 6);
+            }
+        }
+
+        return $this->fromScaledInt($totalScaled, 6);
     }
 
-    /**
-     * Вычисляет текущую вместимость хранилища Fog для города:
-     * BaseStorage (200) + сумма storage_capacity активных зданий по их уровню.
-     */
-    public function calculateFogStorageCap(City $city): float
+    public function calculateFogStorageCap(City $city): string
     {
-        $extraCapacity = 0.0;
+        $economy = $this->economy();
+        $baseScaled = $this->toScaledInt($economy->normalizeDecimal(self::BASE_STORAGE_CAPACITY, 6), 6);
+        $extraScaled = 0;
 
         if (Schema::hasTable('buildings') && Schema::hasTable('building_level_configs')) {
-            $sum = DB::table('buildings as b')
+            $rows = DB::table('buildings as b')
                 ->join('building_level_configs as blc', function ($join): void {
                     $join->on('blc.building_catalog_id', '=', 'b.building_catalog_id')
                         ->on('blc.level', '=', 'b.level');
                 })
                 ->where('b.city_id', $city->id)
                 ->where('b.status', 'active')
-                ->sum('blc.storage_capacity');
+                ->pluck('blc.storage_capacity');
 
-            $extraCapacity = (float) $sum;
+            foreach ($rows as $val) {
+                $norm = $economy->normalizeDecimal((string) $val, 6);
+                if (!str_starts_with($norm, '-')) {
+                    $extraScaled += $this->toScaledInt($norm, 6);
+                }
+            }
         }
 
-        return round(self::BASE_STORAGE_CAPACITY + max(0.0, $extraCapacity), 6);
+        return $this->fromScaledInt($baseScaled + $extraScaled, 6);
     }
 
-    /**
-     * Выполняет экономический checkpoint за интервал [lockedCity.economy_calculated_at, targetTime)
-     * по текущим активным зданиям города и фазам мира в рамках уже открытой транзакции.
-     *
-     * @return array{
-     *   fog_earned: string,
-     *   storage_cap: string,
-     *   economy_calculated_at: string,
-     *   segments: list<array<string, mixed>>
-     * }
-     */
     public function checkpointLockedCityFog(
         Player $player,
         City $lockedCity,
-        ?float $overrideBaseFogPerHour,
+        string|int|null $overrideBaseFogPerHour,
         string $idempotencyKey,
         CarbonImmutable $targetTime
     ): array {
-        $this->economy()->assertValidResourceType('fog');
+        $economy = $this->economy();
+        $economy->assertValidResourceType('fog');
 
         $fromTime = CarbonImmutable::instance($lockedCity->economy_calculated_at)->utc();
         $effectiveTargetTime = $targetTime->lt($fromTime) ? $fromTime : $targetTime;
 
-        $baseFogPerHour = $overrideBaseFogPerHour ?? $this->calculateCityBaseFogPerHour($lockedCity);
+        $baseFogPerHour = $overrideBaseFogPerHour !== null
+            ? $economy->normalizeDecimal((string) $overrideBaseFogPerHour, 6)
+            : $this->calculateCityBaseFogPerHour($lockedCity);
+
         $calc = $this->worldPhaseService->calculateFogForInterval($fromTime, $effectiveTargetTime, $baseFogPerHour);
-        $rawFogEarned = round((float) $calc['total_fog'], 6);
-        $storageCap = $this->calculateFogStorageCap($lockedCity);
+        $rawFogScaled = $this->toScaledInt($economy->normalizeDecimal((string) $calc['total_fog'], 6), 6);
+        $storageCapFormatted = $this->calculateFogStorageCap($lockedCity);
+        $storageCapScaled = $this->toScaledInt($storageCapFormatted, 6);
 
         $existingResource = DB::table('player_resources')
             ->where('player_id', $player->id)
@@ -106,28 +108,32 @@ class OfflineEconomyService
             ->lockForUpdate()
             ->first();
 
-        $currentBalance = $existingResource !== null ? round((float) $existingResource->balance, 6) : 0.0;
-        $availableCapacity = max(0.0, round($storageCap - $currentBalance, 6));
-        $actualFogEarned = round(min($rawFogEarned, $availableCapacity), 6);
-        $fogFormatted = number_format($actualFogEarned, 6, '.', '');
+        $currentBalanceFormatted = $existingResource !== null
+            ? $economy->normalizeDecimal((string) $existingResource->balance, 6)
+            : '0.000000';
+        $currentBalanceScaled = $this->toScaledInt($currentBalanceFormatted, 6);
 
-        if ($actualFogEarned > 0) {
-            $newBalanceFormatted = number_format(round($currentBalance + $actualFogEarned, 6), 6, '.', '');
+        $availableCapacityScaled = max(0, $storageCapScaled - $currentBalanceScaled);
+        $actualFogScaled = min($rawFogScaled, $availableCapacityScaled);
+        $fogFormatted = $this->fromScaledInt($actualFogScaled, 6);
+
+        if ($actualFogScaled > 0) {
+            $newBalanceFormatted = $this->fromScaledInt($currentBalanceScaled + $actualFogScaled, 6);
 
             if ($existingResource !== null) {
                 DB::table('player_resources')
                     ->where('id', $existingResource->id)
                     ->update([
                         'balance' => $newBalanceFormatted,
-                        'updated_at' => $targetTime,
+                        'updated_at' => $effectiveTargetTime,
                     ]);
             } else {
                 DB::table('player_resources')->insert([
                     'player_id' => $player->id,
                     'resource_type' => 'fog',
                     'balance' => $newBalanceFormatted,
-                    'created_at' => $targetTime,
-                    'updated_at' => $targetTime,
+                    'created_at' => $effectiveTargetTime,
+                    'updated_at' => $effectiveTargetTime,
                 ]);
             }
 
@@ -137,7 +143,7 @@ class OfflineEconomyService
                 'amount' => $fogFormatted,
                 'operation_type' => 'offline_production',
                 'idempotency_key' => $idempotencyKey,
-                'created_at' => $targetTime,
+                'created_at' => $effectiveTargetTime,
             ];
 
             $columns = DB::getSchemaBuilder()->getColumnListing('resource_ledgers');
@@ -151,7 +157,7 @@ class OfflineEconomyService
                 $ledgerPayload['transaction_id'] = (string) Str::uuid();
             }
             if (in_array('updated_at', $columns, true)) {
-                $ledgerPayload['updated_at'] = $targetTime;
+                $ledgerPayload['updated_at'] = $effectiveTargetTime;
             }
 
             DB::table('resource_ledgers')->insert($ledgerPayload);
@@ -163,25 +169,12 @@ class OfflineEconomyService
 
         return [
             'fog_earned' => $fogFormatted,
-            'storage_cap' => number_format($storageCap, 6, '.', ''),
-            'economy_calculated_at' => $targetTime->toIso8601String(),
+            'storage_cap' => $storageCapFormatted,
+            'economy_calculated_at' => $effectiveTargetTime->toIso8601String(),
             'segments' => $calc['segments'],
         ];
     }
 
-    /**
-     * Начисляет оффлайн-доход fog за интервал [city.economy_calculated_at, now)
-     * с учётом фаз мира и лимита вместимости хранилища, обновляет economy_calculated_at,
-     * ledger и transaction_outbox. Поддерживает идемпотентность по player_id + idempotency_key.
-     *
-     * @return array{
-     *   idempotent_replay: bool,
-     *   fog_earned: string,
-     *   storage_cap: string,
-     *   economy_calculated_at: string,
-     *   segments: list<array<string, mixed>>
-     * }
-     */
     public function syncFogProduction(
         Player $player,
         City $city,
@@ -193,20 +186,23 @@ class OfflineEconomyService
             throw new InvalidArgumentException('City does not belong to the specified player.');
         }
 
-        $this->economy()->assertValidResourceType('fog');
+        $economy = $this->economy();
+        $economy->assertValidResourceType('fog');
 
         $targetTime = CarbonImmutable::instance($now ?? CarbonImmutable::now('UTC'))->utc();
+        $normalizedRate = $economy->normalizeDecimal($baseFogPerHour, 6);
+
         $requestHash = hash('sha256', json_encode([
             'player_id' => $player->id,
             'city_id' => $city->id,
-            'base_fog_per_hour' => number_format((float) $baseFogPerHour, 6, '.', ''),
+            'base_fog_per_hour' => $normalizedRate,
             'target_time' => $targetTime->toIso8601String(),
         ], JSON_THROW_ON_ERROR));
 
         return DB::transaction(function () use (
             $player,
             $city,
-            $baseFogPerHour,
+            $normalizedRate,
             $idempotencyKey,
             $requestHash,
             $targetTime
@@ -238,7 +234,7 @@ class OfflineEconomyService
             $checkpoint = $this->checkpointLockedCityFog(
                 $player,
                 $lockedCity,
-                round((float) $baseFogPerHour, 6),
+                $normalizedRate,
                 $idempotencyKey,
                 $targetTime
             );
@@ -286,7 +282,18 @@ class OfflineEconomyService
             return $responsePayload;
         });
     }
+
+    private function toScaledInt(string $unsignedNormalized, int $scale): int
+    {
+        [$intPart, $fracPart] = array_pad(explode('.', $unsignedNormalized, 2), 2, '');
+        return (int) ($intPart . str_pad($fracPart, $scale, '0', STR_PAD_RIGHT));
+    }
+
+    private function fromScaledInt(int $scaled, int $scale): string
+    {
+        $factor = 10 ** $scale;
+        $intPart = intdiv($scaled, $factor);
+        $fracPart = str_pad((string) ($scaled % $factor), $scale, '0', STR_PAD_LEFT);
+        return $intPart . '.' . $fracPart;
+    }
 }
-
-
-

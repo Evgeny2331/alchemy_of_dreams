@@ -164,7 +164,7 @@ class ApiEndpointsTest extends TestCase
             ->where('player_id', $player->id)
             ->where('resource_type', 'fog')
             ->value('balance');
-        $this->assertSame('90.000000', (string) $fogBalance);
+        $this->assertSame('75.000000', (string) $fogBalance);
 
         // При нехватке fog возвращается 422
         DB::table('player_resources')
@@ -172,10 +172,13 @@ class ApiEndpointsTest extends TestCase
             ->where('resource_type', 'fog')
             ->update(['balance' => '5.000000']);
 
-        $this->withToken($token)->postJson('/api/v1/alchemy/transmute', [
-            'components' => [
-                ['component_type' => 'resource', 'component_key' => 'fog', 'quantity' => '10'],
-            ],
-        ])->assertStatus(422);
+        $r = $this->withToken($token)
+            ->withHeader('Idempotency-Key', 'test-insufficient-fog-1')
+            ->postJson('/api/v1/alchemy/transmute', [
+                'components' => [
+                    ['component_type' => 'resource', 'component_key' => 'fog', 'quantity' => '10'],
+                ],
+            ]);
+        $r->assertStatus(422);
     }
 }

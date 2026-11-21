@@ -10,6 +10,7 @@ use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
+use RuntimeException;
 
 class AlchemyService
 {
@@ -22,12 +23,6 @@ class AlchemyService
         return $this->economyService ?? app(EconomyService::class);
     }
 
-    /**
-     * Подбирает активный рецепт по списку компонентов:
-     * [['component_type' => '...', 'component_key' => '...', 'quantity' => '1.000000'], ...]
-     *
-     * @param  list<array{component_type: string, component_key: string, quantity: string|int|float}>  $components
-     */
     public function findMatchingRecipe(array $components): ?Recipe
     {
         if ($components === []) {
@@ -60,79 +55,120 @@ class AlchemyService
         return null;
     }
 
-    /**
-     * Проводит алхимический синтез для игрока, списывает ресурсные компоненты через EconomyService
-     * и при совпадении рецепта фиксирует его в player_recipe_archive без создания дублей.
-     *
-     * @param  list<array{component_type: string, component_key: string, quantity: string|int|float}>  $components
-     * @return array{matched: bool, recipe: ?Recipe, archive_entry: ?PlayerRecipeArchive, newly_unlocked: bool}
-     */
-    public function transmute(Player $player, array $components, ?CarbonImmutable $now = null): array
-    {
+    public function transmute(
+        Player $player,
+        array $components,
+        ?CarbonImmutable $now = null,
+        ?string $idempotencyKey = null
+    ): array {
         $timestamp = ($now ?? CarbonImmutable::now('UTC'))->utc();
+        $economy = $this->economy();
         $normalized = $this->normalizeComponents($components);
         $recipe = $this->findMatchingRecipe($components);
+        $opKey = $idempotencyKey ?? hash('sha256', json_encode([
+            'player_id' => $player->id,
+            'components' => $normalized,
+            'ts' => $timestamp->toIso8601String(),
+        ], JSON_THROW_ON_ERROR));
 
         if ($recipe === null) {
-            DB::table('transaction_outbox')->insert([
-                'event_id' => (string) Str::uuid(),
-                'event_type' => 'alchemy.experiment.unmatched',
-                'payload' => json_encode([
-                    'player_id' => $player->id,
-                    'components' => $normalized,
-                ], JSON_THROW_ON_ERROR),
-                'occurred_at' => $timestamp,
-                'published_at' => null,
-                'attempts' => 0,
-                'created_at' => $timestamp,
-                'updated_at' => $timestamp,
-            ]);
+            return DB::transaction(function () use ($player, $normalized, $timestamp, $opKey, $economy): array {
+                $protectedTypes = (array) config('game_balance.alchemy.protected_component_types', ['metaphor', 'critical_metaphor']);
+                $failedFogCap = $economy->normalizeDecimal((string) config('game_balance.alchemy.failed_experiment_consumes_base_fog', '0.000000'), 6);
 
-            return [
-                'matched' => false,
-                'recipe' => null,
-                'archive_entry' => null,
-                'newly_unlocked' => false,
-            ];
+                foreach ($normalized as $item) {
+                    if ($item['component_type'] !== 'resource') {
+                        continue;
+                    }
+                    if (in_array($item['component_key'], $protectedTypes, true)) {
+                        continue;
+                    }
+
+                    $resourceKey = $item['component_key'];
+                    $requestedQty = $economy->normalizeDecimal((string) $item['quantity'], 6);
+                    $economy->assertValidResourceType($resourceKey);
+
+                    $currentBalance = $economy->normalizeDecimal(
+                        (string) (DB::table('player_resources')
+                            ->where('player_id', $player->id)
+                            ->where('resource_type', $resourceKey)
+                            ->lockForUpdate()
+                            ->value('balance') ?? '0.000000'),
+                        6
+                    );
+
+                    if ($this->toScaledInt($currentBalance, 6) < $this->toScaledInt($requestedQty, 6)) {
+                        throw new RuntimeException("Insufficient {$resourceKey} balance (required: {$requestedQty}, available: {$currentBalance}).");
+                    }
+
+                    if ($resourceKey === 'fog' && $this->toScaledInt($failedFogCap, 6) > 0) {
+                        $spend = $this->minDecimal($requestedQty, $failedFogCap);
+                        if ($this->toScaledInt($spend, 6) > 0) {
+                    $economy->applyResourceDelta(
+                                $player,
+                                'fog',
+                                '-' . $spend,
+                                'alchemy_failed_experiment',
+                                "{$opKey}:fail:fog",
+                                'player',
+                                $player->id,
+                                $timestamp
+                            );
+                        }
+                    }
+                }
+
+                DB::table('transaction_outbox')->insert([
+                    'event_id' => (string) Str::uuid(),
+                    'event_type' => 'alchemy.experiment.unmatched',
+                    'payload' => json_encode([
+                        'player_id' => $player->id,
+                        'components' => $normalized,
+                    ], JSON_THROW_ON_ERROR),
+                    'occurred_at' => $timestamp,
+                    'published_at' => null,
+                    'attempts' => 0,
+                    'created_at' => $timestamp,
+                    'updated_at' => $timestamp,
+                ]);
+
+                return [
+                    'matched' => false,
+                    'recipe' => null,
+                    'archive_entry' => null,
+                    'newly_unlocked' => false,
+                ];
+            });
         }
 
-        return DB::transaction(function () use ($player, $recipe, $normalized, $timestamp): array {
+        return DB::transaction(function () use ($player, $recipe, $normalized, $timestamp, $opKey, $economy): array {
+            $protectedTypes = (array) config('game_balance.alchemy.protected_component_types', ['metaphor', 'critical_metaphor']);
+            $protectedCategories = (array) config('game_balance.alchemy.protected_categories', ['critical']);
+            $isProtectedRecipe = in_array((string) $recipe->category, $protectedCategories, true);
+
             foreach ($normalized as $item) {
                 if ($item['component_type'] !== 'resource') {
                     continue;
                 }
+                if ($isProtectedRecipe && in_array($item['component_key'], $protectedTypes, true)) {
+                    continue;
+                }
 
-                $cost = (float) $item['quantity'];
+                $cost = $economy->normalizeDecimal((string) $item['quantity'], 6);
                 $resourceKey = $item['component_key'];
 
-                $this->economy()->applyResourceDelta(
-                    $player,
-                    $resourceKey,
-                    number_format(-$cost, 6, '.', ''),
-                    'alchemy_transmute',
-                    "alchemy:{$player->id}:{$recipe->id}:{$resourceKey}:" . (string) Str::uuid(),
-                    'recipe',
-                    $recipe->id,
-                    $timestamp
-                );
-            }
-
-            $resultPayload = is_array($recipe->result_payload) ? $recipe->result_payload : [];
-            if (
-                isset($resultPayload['resource_type'], $resultPayload['amount'])
-                && is_string($resultPayload['resource_type'])
-                && (float) $resultPayload['amount'] > 0
-            ) {
-                $this->economy()->applyResourceDelta(
-                    $player,
-                    $resultPayload['resource_type'],
-                    number_format((float) $resultPayload['amount'], 6, '.', ''),
-                    'alchemy_result',
-                    "alchemy_result:{$player->id}:{$recipe->id}:" . (string) Str::uuid(),
-                    'recipe',
-                    $recipe->id,
-                    $timestamp
-                );
+                if ($this->toScaledInt($cost, 6) > 0) {
+                    $economy->applyResourceDelta(
+                        $player,
+                        $resourceKey,
+                        '-' . $cost,
+                        'alchemy_transmute',
+                        "{$opKey}:consume:{$recipe->id}:{$resourceKey}",
+                        'recipe',
+                        $recipe->id,
+                        $timestamp
+                    );
+                }
             }
 
             $existing = PlayerRecipeArchive::query()
@@ -155,6 +191,27 @@ class AlchemyService
                     ->firstOrFail();
 
                 $newlyUnlocked = true;
+            }
+
+            $resultPayload = is_array($recipe->result_payload) ? $recipe->result_payload : [];
+            if (
+                $newlyUnlocked
+                && isset($resultPayload['resource_type'], $resultPayload['amount'])
+                && is_string($resultPayload['resource_type'])
+            ) {
+                $rewardAmount = $economy->normalizeDecimal((string) $resultPayload['amount'], 6);
+                if ($this->toScaledInt($rewardAmount, 6) > 0) {
+                    $economy->applyResourceDelta(
+                        $player,
+                        $resultPayload['resource_type'],
+                        $rewardAmount,
+                        'alchemy_unlock_reward',
+                        "{$opKey}:unlock_reward:{$recipe->id}",
+                        'recipe',
+                        $recipe->id,
+                        $timestamp
+                    );
+                }
             }
 
             DB::table('transaction_outbox')->insert([
@@ -182,14 +239,9 @@ class AlchemyService
         });
     }
 
-    /**
-     * Нормализует и сортирует список компонентов для независимого от порядка сравнения.
-     *
-     * @param  list<array{component_type: string, component_key: string, quantity: string|int|float}>  $items
-     * @return list<array{component_type: string, component_key: string, quantity: string}>
-     */
     private function normalizeComponents(array $items): array
     {
+        $economy = $this->economy();
         $aggregated = [];
 
         foreach ($items as $item) {
@@ -203,17 +255,19 @@ class AlchemyService
 
             $type = trim($item['component_type']);
             $key = trim($item['component_key']);
-            $qty = (float) $item['quantity'];
+            $qtyNorm = $economy->normalizeDecimal((string) $item['quantity'], 6);
+            $qtyScaled = $this->toScaledInt($qtyNorm, 6);
 
-            if ($type === '' || $key === '' || $qty <= 0) {
+            if ($type === '' || $key === '' || $qtyScaled <= 0) {
                 throw new InvalidArgumentException('Component type, key, and positive quantity are required.');
             }
 
             $mapKey = $type . "\0" . $key;
+            $currentScaled = $aggregated[$mapKey]['scaled'] ?? 0;
             $aggregated[$mapKey] = [
                 'component_type' => $type,
                 'component_key' => $key,
-                'quantity' => ($aggregated[$mapKey]['quantity'] ?? 0.0) + $qty,
+                'scaled' => $currentScaled + $qtyScaled,
             ];
         }
 
@@ -226,8 +280,29 @@ class AlchemyService
             return [
                 'component_type' => $row['component_type'],
                 'component_key' => $row['component_key'],
-                'quantity' => number_format($row['quantity'], 6, '.', ''),
+                'quantity' => $this->fromScaledInt($row['scaled'], 6),
             ];
         }, $aggregated));
+    }
+
+    private function minDecimal(string $a, string $b): string
+    {
+        $sa = $this->toScaledInt($this->economy()->normalizeDecimal($a, 6), 6);
+        $sb = $this->toScaledInt($this->economy()->normalizeDecimal($b, 6), 6);
+        return $this->fromScaledInt(min($sa, $sb), 6);
+    }
+
+    private function toScaledInt(string $unsignedNormalized, int $scale): int
+    {
+        [$intPart, $fracPart] = array_pad(explode('.', $unsignedNormalized, 2), 2, '');
+        return (int) ($intPart . str_pad($fracPart, $scale, '0', STR_PAD_RIGHT));
+    }
+
+    private function fromScaledInt(int $scaled, int $scale): string
+    {
+        $factor = 10 ** $scale;
+        $intPart = intdiv($scaled, $factor);
+        $fracPart = str_pad((string) ($scaled % $factor), $scale, '0', STR_PAD_LEFT);
+        return $intPart . '.' . $fracPart;
     }
 }

@@ -2,6 +2,7 @@
 
 namespace App\Modules\WorldPhase\Services;
 
+use App\Modules\Economy\Services\EconomyService;
 use App\Modules\WorldPhase\Models\WorldPhase;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterface;
@@ -11,12 +12,18 @@ use InvalidArgumentException;
 
 class WorldPhaseService
 {
-    /**
-     * Создаёт фазу мира; пересечение интервалов предотвращается GIST-ограничением и проверкой.
-     */
+    public function __construct(
+        private readonly ?EconomyService $economyService = null
+    ) {}
+
+    private function economy(): EconomyService
+    {
+        return $this->economyService ?? app(EconomyService::class);
+    }
+
     public function createPhase(
         string $phaseName,
-        string|int|float $multiplierFog,
+        string|int $multiplierFog,
         CarbonInterface $startsAt,
         CarbonInterface $endsAt
     ): WorldPhase {
@@ -27,7 +34,10 @@ class WorldPhaseService
             throw new InvalidArgumentException('Phase ends_at must be strictly greater than starts_at.');
         }
 
-        if ((float) $multiplierFog < 0) {
+        $economy = $this->economy();
+        $formattedMultiplier = $economy->normalizeDecimal((string) $multiplierFog, 6);
+
+        if (str_starts_with($formattedMultiplier, '-')) {
             throw new InvalidArgumentException('multiplier_fog must be non-negative.');
         }
 
@@ -43,7 +53,7 @@ class WorldPhaseService
         try {
             return WorldPhase::create([
                 'phase_name' => $phaseName,
-                'multiplier_fog' => number_format((float) $multiplierFog, 6, '.', ''),
+                'multiplier_fog' => $formattedMultiplier,
                 'starts_at' => $start,
                 'ends_at' => $end,
             ]);
@@ -52,14 +62,10 @@ class WorldPhaseService
         }
     }
 
-    /**
-     * Возвращает фазу мира, активную в указанный момент времени (или null).
-     */
     public function getActivePhaseAt(?CarbonInterface $at = null): ?WorldPhase
     {
         $point = CarbonImmutable::instance($at ?? CarbonImmutable::now('UTC'))->utc();
 
-        /** @var ?WorldPhase */
         return WorldPhase::query()
             ->where('starts_at', '<=', $point)
             ->where('ends_at', '>', $point)
@@ -67,10 +73,6 @@ class WorldPhaseService
             ->first();
     }
 
-    /**
-     * Проверяет непрерывность расписания фаз на интервале [from, to).
-     * Выбрасывает DomainException при наличии пробела.
-     */
     public function assertContinuousSchedule(CarbonInterface $from, CarbonInterface $to): void
     {
         $start = CarbonImmutable::instance($from)->utc();
@@ -113,25 +115,10 @@ class WorldPhaseService
         }
     }
 
-    /**
-     * Разбивает интервал [from, to) на сегменты с учётом фаз мира и базовой скорости fog/час.
-     *
-     * @return array{
-     *   total_fog: string,
-     *   segments: list<array{
-     *     from: string,
-     *     to: string,
-     *     seconds: int,
-     *     phase_name: ?string,
-     *     multiplier_fog: string,
-     *     fog_earned: string
-     *   }>
-     * }
-     */
     public function calculateFogForInterval(
         CarbonInterface $from,
         CarbonInterface $to,
-        string|int|float $baseFogPerHour
+        string|int $baseFogPerHour
     ): array {
         $start = CarbonImmutable::instance($from)->utc();
         $end = CarbonImmutable::instance($to)->utc();
@@ -140,10 +127,15 @@ class WorldPhaseService
             throw new InvalidArgumentException('Interval end must not be earlier than start.');
         }
 
-        $baseRate = (float) $baseFogPerHour;
-        if ($baseRate < 0 || $start->equalTo($end)) {
+        $economy = $this->economy();
+        $baseRate = $economy->normalizeDecimal((string) $baseFogPerHour, 6);
+        if (str_starts_with($baseRate, '-')) {
+            throw new InvalidArgumentException('baseFogPerHour must be non-negative.');
+        }
+
+        if ($start->equalTo($end) || $baseRate === '0.000000') {
             return [
-                'total_fog' => number_format(0, 6, '.', ''),
+                'total_fog' => '0.000000',
                 'segments' => [],
             ];
         }
@@ -156,7 +148,10 @@ class WorldPhaseService
 
         $cursor = $start;
         $segments = [];
-        $totalFog = 0.0;
+        $totalScaled = 0;
+        $baseScaled = $this->toScaledInt($baseRate, 6);
+        $defaultMultFormatted = '1.000000';
+        $defaultMultScaled = 1_000_000;
 
         foreach ($phases as $phase) {
             $pStart = CarbonImmutable::instance($phase->starts_at)->utc();
@@ -166,15 +161,15 @@ class WorldPhaseService
                 $segEnd = $pStart->lt($end) ? $pStart : $end;
                 $seconds = $segEnd->getTimestamp() - $cursor->getTimestamp();
                 if ($seconds > 0) {
-                    $earned = ($baseRate * 1.0) * ($seconds / 3600.0);
-                    $totalFog += $earned;
+                    $earnedScaled = $this->computeSegmentScaled($baseScaled, $defaultMultScaled, $seconds);
+                    $totalScaled += $earnedScaled;
                     $segments[] = [
                         'from' => $cursor->toIso8601String(),
                         'to' => $segEnd->toIso8601String(),
                         'seconds' => $seconds,
                         'phase_name' => null,
-                        'multiplier_fog' => number_format(1.0, 6, '.', ''),
-                        'fog_earned' => number_format($earned, 6, '.', ''),
+                        'multiplier_fog' => $defaultMultFormatted,
+                        'fog_earned' => $this->fromScaledInt($earnedScaled, 6),
                     ];
                 }
                 $cursor = $segEnd;
@@ -189,16 +184,18 @@ class WorldPhaseService
             $seconds = $activeEnd->getTimestamp() - $activeStart->getTimestamp();
 
             if ($seconds > 0) {
-                $mult = (float) $phase->multiplier_fog;
-                $earned = ($baseRate * $mult) * ($seconds / 3600.0);
-                $totalFog += $earned;
+                $multFormatted = $economy->normalizeDecimal((string) $phase->multiplier_fog, 6);
+                $multScaled = $this->toScaledInt($multFormatted, 6);
+                $earnedScaled = $this->computeSegmentScaled($baseScaled, $multScaled, $seconds);
+                $totalScaled += $earnedScaled;
+
                 $segments[] = [
                     'from' => $activeStart->toIso8601String(),
                     'to' => $activeEnd->toIso8601String(),
                     'seconds' => $seconds,
                     'phase_name' => $phase->phase_name,
-                    'multiplier_fog' => number_format($mult, 6, '.', ''),
-                    'fog_earned' => number_format($earned, 6, '.', ''),
+                    'multiplier_fog' => $multFormatted,
+                    'fog_earned' => $this->fromScaledInt($earnedScaled, 6),
                 ];
                 $cursor = $activeEnd;
             }
@@ -211,22 +208,44 @@ class WorldPhaseService
         if ($cursor->lt($end)) {
             $seconds = $end->getTimestamp() - $cursor->getTimestamp();
             if ($seconds > 0) {
-                $earned = ($baseRate * 1.0) * ($seconds / 3600.0);
-                $totalFog += $earned;
+                $earnedScaled = $this->computeSegmentScaled($baseScaled, $defaultMultScaled, $seconds);
+                $totalScaled += $earnedScaled;
                 $segments[] = [
                     'from' => $cursor->toIso8601String(),
                     'to' => $end->toIso8601String(),
                     'seconds' => $seconds,
                     'phase_name' => null,
-                    'multiplier_fog' => number_format(1.0, 6, '.', ''),
-                    'fog_earned' => number_format($earned, 6, '.', ''),
+                    'multiplier_fog' => $defaultMultFormatted,
+                    'fog_earned' => $this->fromScaledInt($earnedScaled, 6),
                 ];
             }
         }
 
         return [
-            'total_fog' => number_format($totalFog, 6, '.', ''),
+            'total_fog' => $this->fromScaledInt($totalScaled, 6),
             'segments' => $segments,
         ];
+    }
+
+    private function computeSegmentScaled(int $baseScaled, int $multScaled, int $seconds): int
+    {
+        // baseScaled (10^6) * multScaled (10^6) * seconds / (3600 * 10^6) -> масштаб 10^6
+        $numerator = $baseScaled * $multScaled * $seconds;
+        $denominator = 3600 * 1_000_000;
+        return (int) intdiv(($numerator + intdiv($denominator, 2)), $denominator);
+    }
+
+    private function toScaledInt(string $unsignedNormalized, int $scale): int
+    {
+        [$intPart, $fracPart] = array_pad(explode('.', $unsignedNormalized, 2), 2, '');
+        return (int) ($intPart . str_pad($fracPart, $scale, '0', STR_PAD_RIGHT));
+    }
+
+    private function fromScaledInt(int $scaled, int $scale): string
+    {
+        $factor = 10 ** $scale;
+        $intPart = intdiv($scaled, $factor);
+        $fracPart = str_pad((string) ($scaled % $factor), $scale, '0', STR_PAD_LEFT);
+        return $intPart . '.' . $fracPart;
     }
 }

@@ -8,6 +8,7 @@ use App\Modules\Expedition\Services\ExpeditionService;
 use App\Modules\Residents\Models\Resident;
 use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use RuntimeException;
 use Tests\TestCase;
 
@@ -18,6 +19,13 @@ class ExpeditionLifecycleTest extends TestCase
     public function test_expedition_start_complete_and_prevent_double_claim(): void
     {
         $player = Player::create(['telegram_id' => 2001, 'first_name' => 'Voyager']);
+        DB::table('player_resources')->insert([
+            'player_id' => $player->id,
+            'resource_type' => 'fog',
+            'balance' => '50.000000',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
         $city = City::create([
             'player_id' => $player->id,
             'name' => 'Dream Harbor',
@@ -53,8 +61,8 @@ class ExpeditionLifecycleTest extends TestCase
         $this->assertCount(2, $expedition->participants);
         $this->assertEquals('4.00', $r1->fresh()->energy);
         $this->assertEquals('expedition', $r1->fresh()->status);
+        $this->assertEquals('35.000000', (string) DB::table('player_resources')->where('player_id', $player->id)->where('resource_type', 'fog')->value('balance'));
 
-        // Попытка claim до завершения времени должна упасть
         $this->expectException(RuntimeException::class);
         $service->claimReward($expedition, $start->addMinutes(2));
     }
@@ -62,6 +70,13 @@ class ExpeditionLifecycleTest extends TestCase
     public function test_expedition_reward_claimed_only_once(): void
     {
         $player = Player::create(['telegram_id' => 2002, 'first_name' => 'Navigator']);
+        DB::table('player_resources')->insert([
+            'player_id' => $player->id,
+            'resource_type' => 'fog',
+            'balance' => '50.000000',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
         $city = City::create([
             'player_id' => $player->id,
             'name' => 'Astral Port',
@@ -91,7 +106,6 @@ class ExpeditionLifecycleTest extends TestCase
         $this->assertEquals('claimed', $firstClaim['expedition']->status);
         $this->assertArrayHasKey('memories', $firstClaim['rewards']);
 
-        // Повторный claim должен быть отклонен
         $this->expectException(RuntimeException::class);
         $service->claimReward($completed, $start->addMinutes(7));
     }

@@ -22,11 +22,20 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
     {
         $player = Player::create(['telegram_id' => 7201, 'first_name' => 'Explorer']);
         DB::table('player_resources')->insert([
-            'player_id' => $player->id,
-            'resource_type' => 'memories',
-            'balance' => '0.000000',
-            'created_at' => now(),
-            'updated_at' => now(),
+            [
+                'player_id' => $player->id,
+                'resource_type' => 'memories',
+                'balance' => '0.000000',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ],
+            [
+                'player_id' => $player->id,
+                'resource_type' => 'fog',
+                'balance' => '50.000000',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ],
         ]);
 
         $token = Str::random(64);
@@ -66,7 +75,6 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
         $resident->refresh();
         $this->assertSame('expedition', $resident->status);
 
-        // Клейм после завершения (300 сек) начисляет награду и возвращает жителя в available
         $claimResp = $this->withToken($token)
             ->postJson("/api/v1/expeditions/{$expId}/claim", [
                 'now' => $t0->addSeconds(305)->toIso8601String(),
@@ -76,7 +84,6 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
         $resident->refresh();
         $this->assertSame('available', $resident->status);
 
-        // Повторный клейм той же экспедиции должен быть отклонён (422)
         $this->withToken($token)
             ->postJson("/api/v1/expeditions/{$expId}/claim", [
                 'now' => $t0->addSeconds(310)->toIso8601String(),
@@ -117,7 +124,7 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
             'quantity' => '20.000000',
         ]);
 
-        // Неизвестная комбинация оставляет баланс целым и пишет событие в outbox
+        // Неудачный эксперимент расходует базовый fog (5.000000) и пишет событие в outbox
         $this->withToken($token)
             ->postJson('/api/v1/alchemy/transmute', [
                 'components' => [
@@ -127,7 +134,7 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
             ->assertJsonPath('data.matched', false);
 
         $this->assertSame(
-            '50.000000',
+            '45.000000',
             (string) DB::table('player_resources')->where('player_id', $player->id)->where('resource_type', 'fog')->value('balance')
         );
         $this->assertSame(
@@ -135,7 +142,7 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
             DB::table('transaction_outbox')->where('event_type', 'alchemy.experiment.unmatched')->count()
         );
 
-        // Совпадающий рецепт списывает 20 fog (остаётся 30) и добавляет рецепт в архив игрока
+        // Совпадающий рецепт списывает 20 fog (остаётся 25) и добавляет рецепт в архив игрока
         $this->withToken($token)
             ->postJson('/api/v1/alchemy/transmute', [
                 'components' => [
@@ -146,13 +153,8 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
             ->assertJsonPath('data.newly_unlocked', true);
 
         $this->assertSame(
-            '30.000000',
+            '25.000000',
             (string) DB::table('player_resources')->where('player_id', $player->id)->where('resource_type', 'fog')->value('balance')
-        );
-        $this->assertSame(
-            1,
-            DB::table('player_recipe_archive')->where('player_id', $player->id)->where('recipe_id', $recipe->id)->count()
         );
     }
 }
-

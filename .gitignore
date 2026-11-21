@@ -1,0 +1,12 @@
+/backend/vendor/
+/backend/node_modules/
+/backend/.env
+/backend/.env.backup
+/backend/storage/*.key
+/backend/storage/logs/*.log
+/backend/bootstrap/cache/*.php
+/.env
+/.env.*
+!.env.example
+.DS_Store
+Thumbs.db

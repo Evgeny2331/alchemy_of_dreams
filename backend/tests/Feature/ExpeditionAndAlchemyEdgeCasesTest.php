@@ -87,7 +87,7 @@ class ExpeditionAndAlchemyEdgeCasesTest extends TestCase
         $this->withToken($token)
             ->postJson("/api/v1/expeditions/{$expId}/claim", [
                 'now' => $t0->addSeconds(310)->toIso8601String(),
-            ])->assertStatus(422);
+            ])->assertStatus(409);
     }
 
     public function test_alchemy_transmute_deducts_components_and_records_unmatched_event(): void

@@ -13,7 +13,6 @@ use App\Modules\Residents\Services\ResidentService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
 use InvalidArgumentException;
 use RuntimeException;
 
@@ -29,11 +28,11 @@ class ResidentController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         if ((int) $city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: city does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: city does not belong to player.', 403);
         }
 
         $residents = Resident::query()
@@ -43,7 +42,7 @@ class ResidentController extends Controller
 
         return response()->json([
             'data' => $residents,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 
@@ -52,12 +51,12 @@ class ResidentController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $resident->loadMissing('city');
         if ($resident->city === null || (int) $resident->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: resident does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: resident does not belong to player.', 403);
         }
 
         $validated = $request->validate([
@@ -70,12 +69,12 @@ class ResidentController extends Controller
         try {
             $updated = $this->residentService->assignToBuilding($resident, $building);
         } catch (InvalidArgumentException|RuntimeException $e) {
-            return response()->json(['message' => $e->getMessage()], 422);
+            return $this->apiError('INVALID_GAME_STATE', $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $updated,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 
@@ -84,23 +83,23 @@ class ResidentController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $resident->loadMissing('city');
         if ($resident->city === null || (int) $resident->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: resident does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: resident does not belong to player.', 403);
         }
 
         try {
             $updated = $this->residentService->unassign($resident);
         } catch (RuntimeException $e) {
-            return response()->json(['message' => $e->getMessage()], 422);
+            return $this->apiError('INVALID_GAME_STATE', $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $updated,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 
@@ -109,12 +108,12 @@ class ResidentController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $resident->loadMissing('city');
         if ($resident->city === null || (int) $resident->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: resident does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: resident does not belong to player.', 403);
         }
 
         $validated = $request->validate([
@@ -128,12 +127,12 @@ class ResidentController extends Controller
         try {
             $created = $this->residentRequestService->generateRequest($resident, $now);
         } catch (RuntimeException $e) {
-            return response()->json(['message' => $e->getMessage()], 422);
+            return $this->apiError('INVALID_GAME_STATE', $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $created,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ], 201);
     }
 
@@ -142,13 +141,13 @@ class ResidentController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $residentRequest->loadMissing('resident.city');
         $ownerId = $residentRequest->resident?->city?->player_id;
         if ($ownerId === null || (int) $ownerId !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: request does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: request does not belong to player.', 403);
         }
 
         $validated = $request->validate([
@@ -162,12 +161,16 @@ class ResidentController extends Controller
         try {
             $completed = $this->residentRequestService->completeRequest($residentRequest, $now);
         } catch (RuntimeException $e) {
-            return response()->json(['message' => $e->getMessage()], 422);
+            $code = str_contains(strtolower($e->getMessage()), 'insufficient')
+                ? 'INSUFFICIENT_RESOURCES'
+                : 'INVALID_GAME_STATE';
+
+            return $this->apiError($code, $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $completed,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 
@@ -176,24 +179,24 @@ class ResidentController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $residentRequest->loadMissing('resident.city');
         $ownerId = $residentRequest->resident?->city?->player_id;
         if ($ownerId === null || (int) $ownerId !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: request does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: request does not belong to player.', 403);
         }
 
         try {
             $declined = $this->residentRequestService->declineRequest($residentRequest);
         } catch (RuntimeException $e) {
-            return response()->json(['message' => $e->getMessage()], 422);
+            return $this->apiError('INVALID_GAME_STATE', $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $declined,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 }

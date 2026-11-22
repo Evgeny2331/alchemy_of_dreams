@@ -117,7 +117,7 @@ class ResidentLifecycleAndRequestsTest extends TestCase
             ->postJson("/api/v1/residents/{$resident->id}/requests", [
                 'now' => $t0->addHours(2)->toIso8601String(),
             ])
-            ->assertStatus(422);
+            ->assertStatus(409);
 
         // Выполнение запроса повышает trust_level и начисляет награду
         $this->withToken($token)
@@ -134,7 +134,7 @@ class ResidentLifecycleAndRequestsTest extends TestCase
             ->postJson("/api/v1/residents/{$resident->id}/requests", [
                 'now' => $t0->addHours(5)->toIso8601String(),
             ])
-            ->assertStatus(422);
+            ->assertStatus(409);
 
         $secondGen = $this->withToken($token)
             ->postJson("/api/v1/residents/{$resident->id}/requests", [

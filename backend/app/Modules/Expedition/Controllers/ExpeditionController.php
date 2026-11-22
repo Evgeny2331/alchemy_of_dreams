@@ -11,7 +11,6 @@ use App\Modules\Expedition\Services\ExpeditionService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
 use InvalidArgumentException;
 use RuntimeException;
 
@@ -27,7 +26,7 @@ class ExpeditionController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $validated = $request->validate([
@@ -39,7 +38,7 @@ class ExpeditionController extends Controller
         if ($city === null) {
             return response()->json([
                 'data' => ['items' => []],
-                'meta' => ['request_id' => (string) Str::uuid()],
+                'meta' => ['request_id' => $this->apiRequestId()],
             ]);
         }
 
@@ -59,7 +58,7 @@ class ExpeditionController extends Controller
             'data' => [
                 'items' => $items,
             ],
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 
@@ -68,7 +67,7 @@ class ExpeditionController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $validated = $request->validate([
@@ -87,11 +86,11 @@ class ExpeditionController extends Controller
             : City::query()->where('player_id', $sessionPlayer->id)->first();
 
         if ($city === null) {
-            return response()->json(['message' => 'City not found.'], 404);
+            return $this->apiError('RESOURCE_NOT_FOUND', 'City not found.', 404);
         }
 
         if ((int) $city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: city does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: city does not belong to player.', 403);
         }
 
         $expeditionType = (string) ($validated['expedition_type'] ?? $validated['type'] ?? 'surface');
@@ -109,14 +108,16 @@ class ExpeditionController extends Controller
                 $now
             );
         } catch (InvalidArgumentException|RuntimeException $e) {
-            return response()->json([
-                'message' => $e->getMessage(),
-            ], 422);
+            $code = str_contains(strtolower($e->getMessage()), 'insufficient')
+                ? 'INSUFFICIENT_RESOURCES'
+                : 'INVALID_GAME_STATE';
+
+            return $this->apiError($code, $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $expedition,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ], 201);
     }
 
@@ -125,12 +126,12 @@ class ExpeditionController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $expedition->loadMissing('city');
         if ($expedition->city === null || (int) $expedition->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: expedition does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: expedition does not belong to player.', 403);
         }
 
         $validated = $request->validate([
@@ -144,14 +145,16 @@ class ExpeditionController extends Controller
         try {
             $updated = $this->expeditionService->completeExpedition($expedition, $now);
         } catch (RuntimeException $e) {
-            return response()->json([
-                'message' => $e->getMessage(),
-            ], 422);
+            $code = str_contains(strtolower($e->getMessage()), 'not ready')
+                ? 'EXPEDITION_NOT_READY'
+                : 'INVALID_GAME_STATE';
+
+            return $this->apiError($code, $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $updated,
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 
@@ -160,12 +163,12 @@ class ExpeditionController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $expedition->loadMissing('city');
         if ($expedition->city === null || (int) $expedition->city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: expedition does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: expedition does not belong to player.', 403);
         }
 
         $validated = $request->validate([
@@ -178,6 +181,7 @@ class ExpeditionController extends Controller
             : null;
 
         $idemKey = $this->idempotencyService->resolveKey($request);
+        $requestId = $this->apiRequestId();
 
         return $this->idempotencyService->execute(
             $sessionPlayer,
@@ -187,13 +191,26 @@ class ExpeditionController extends Controller
                 'player_id' => $sessionPlayer->id,
                 'expedition_id' => $expedition->id,
             ],
-            function () use ($expedition, $now): array {
+            function () use ($expedition, $now, $requestId): array {
                 try {
                     $result = $this->expeditionService->claimReward($expedition, $now);
                 } catch (RuntimeException $e) {
+                    $lower = strtolower($e->getMessage());
+                    $code = match (true) {
+                        str_contains($lower, 'already claimed') => 'ALREADY_CLAIMED',
+                        str_contains($lower, 'not ready') => 'EXPEDITION_NOT_READY',
+                        default => 'INVALID_GAME_STATE',
+                    };
+
                     return [
-                        'status' => 422,
-                        'payload' => ['message' => $e->getMessage()],
+                        'status' => 409,
+                        'payload' => [
+                            'error' => [
+                                'code' => $code,
+                                'message' => $e->getMessage(),
+                            ],
+                            'meta' => ['request_id' => $requestId],
+                        ],
                     ];
                 }
 
@@ -201,7 +218,7 @@ class ExpeditionController extends Controller
                     'status' => 200,
                     'payload' => [
                         'data' => array_merge($result, ['idempotent_replay' => false]),
-                        'meta' => ['request_id' => (string) Str::uuid()],
+                        'meta' => ['request_id' => $requestId],
                     ],
                 ];
             },

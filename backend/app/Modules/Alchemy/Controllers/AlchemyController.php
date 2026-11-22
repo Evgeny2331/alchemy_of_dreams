@@ -10,7 +10,6 @@ use App\Modules\Economy\Services\IdempotencyService;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
 use InvalidArgumentException;
 use RuntimeException;
 
@@ -26,7 +25,7 @@ class AlchemyController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $entries = PlayerRecipeArchive::query()
@@ -39,7 +38,7 @@ class AlchemyController extends Controller
             'data' => [
                 'recipes' => $entries,
             ],
-            'meta' => ['request_id' => (string) Str::uuid()],
+            'meta' => ['request_id' => $this->apiRequestId()],
         ]);
     }
 
@@ -48,7 +47,7 @@ class AlchemyController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $validated = $request->validate([
@@ -62,7 +61,7 @@ class AlchemyController extends Controller
         ]);
 
         if (isset($validated['player_id']) && (int) $validated['player_id'] !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: player mismatch.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: player mismatch.', 403);
         }
 
         $now = isset($validated['now'])
@@ -70,6 +69,7 @@ class AlchemyController extends Controller
             : null;
 
         $idemKey = $this->idempotencyService->resolveKey($request);
+        $requestId = $this->apiRequestId();
 
         return $this->idempotencyService->execute(
             $sessionPlayer,
@@ -79,7 +79,7 @@ class AlchemyController extends Controller
                 'player_id' => $sessionPlayer->id,
                 'components' => $validated['components'],
             ],
-            function () use ($sessionPlayer, $validated, $now, $idemKey): array {
+            function () use ($sessionPlayer, $validated, $now, $idemKey, $requestId): array {
                 try {
                     $result = $this->alchemyService->transmute(
                         $sessionPlayer,
@@ -88,9 +88,19 @@ class AlchemyController extends Controller
                         $idemKey
                     );
                 } catch (InvalidArgumentException|RuntimeException $e) {
+                    $lower = strtolower($e->getMessage());
+                    $code = str_contains($lower, 'insufficient') ? 'INSUFFICIENT_RESOURCES' : 'INVALID_GAME_STATE';
+                    $status = $code === 'INSUFFICIENT_RESOURCES' ? 409 : 422;
+
                     return [
-                        'status' => 422,
-                        'payload' => ['message' => $e->getMessage()],
+                        'status' => $status,
+                        'payload' => [
+                            'error' => [
+                                'code' => $code,
+                                'message' => $e->getMessage(),
+                            ],
+                            'meta' => ['request_id' => $requestId],
+                        ],
                     ];
                 }
 
@@ -98,7 +108,7 @@ class AlchemyController extends Controller
                     'status' => 200,
                     'payload' => [
                         'data' => array_merge($result, ['idempotent_replay' => false]),
-                        'meta' => ['request_id' => (string) Str::uuid()],
+                        'meta' => ['request_id' => $requestId],
                     ],
                 ];
             },

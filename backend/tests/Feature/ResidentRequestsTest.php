@@ -88,7 +88,7 @@ class ResidentRequestsTest extends TestCase
         $this->withToken($token)
             ->postJson("/api/v1/residents/{$resident->id}/requests", [
                 'now' => $t0->addHours(2)->toIso8601String(),
-            ])->assertStatus(422);
+            ])->assertStatus(409);
 
         // Генерация после кулдауна и отклонение (decline) проходят без блокировки прогресса
         $gen2 = $this->withToken($token)

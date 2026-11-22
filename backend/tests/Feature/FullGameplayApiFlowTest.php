@@ -46,7 +46,7 @@ class FullGameplayApiFlowTest extends TestCase
         PlayerSession::create([
             'player_id' => $player->id,
             'token_hash' => hash('sha256', $token),
-            'expires_at' => $t0->addDay(),
+            'expires_at' => CarbonImmutable::now('UTC')->addDay(),
             'last_used_at' => $t0,
         ]);
 

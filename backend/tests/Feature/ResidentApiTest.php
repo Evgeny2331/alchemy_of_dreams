@@ -101,6 +101,6 @@ class ResidentApiTest extends TestCase
         $resident->update(['status' => 'expedition']);
         $this->withToken($plainToken)
             ->postJson("/api/v1/residents/{$resident->id}/unassign")
-            ->assertStatus(422);
+            ->assertStatus(409);
     }
 }

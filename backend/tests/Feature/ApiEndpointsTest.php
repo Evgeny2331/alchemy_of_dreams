@@ -179,6 +179,6 @@ class ApiEndpointsTest extends TestCase
                     ['component_type' => 'resource', 'component_key' => 'fog', 'quantity' => '10'],
                 ],
             ]);
-        $r->assertStatus(422);
+        $r->assertStatus(409);
     }
 }

@@ -22,7 +22,7 @@ class EconomyController extends Controller
         /** @var Player|null $sessionPlayer */
         $sessionPlayer = $request->attributes->get('player');
         if ($sessionPlayer === null) {
-            return response()->json(['message' => 'Unauthorized.'], 401);
+            return $this->apiError('UNAUTHENTICATED', 'Unauthorized.', 401);
         }
 
         $validated = $request->validate([
@@ -34,22 +34,20 @@ class EconomyController extends Controller
         ]);
 
         if (isset($validated['player_id']) && (int) $validated['player_id'] !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: player mismatch.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: player mismatch.', 403);
         }
 
         $idempotencyKey = (string) ($validated['idempotency_key']
             ?? $request->header('Idempotency-Key', ''));
 
         if ($idempotencyKey === '') {
-            return response()->json([
-                'message' => 'Idempotency key is required.',
-            ], 422);
+            return $this->apiError('VALIDATION_ERROR', 'Idempotency key is required.', 400);
         }
 
         /** @var City $city */
         $city = City::query()->findOrFail($validated['city_id']);
         if ((int) $city->player_id !== (int) $sessionPlayer->id) {
-            return response()->json(['message' => 'Forbidden: city does not belong to player.'], 403);
+            return $this->apiError('FORBIDDEN', 'Forbidden: city does not belong to player.', 403);
         }
 
         $now = isset($validated['now'])
@@ -69,14 +67,12 @@ class EconomyController extends Controller
                 throw $e;
             }
 
-            return response()->json([
-                'message' => $e->getMessage(),
-            ], 422);
+            return $this->apiError('INVALID_GAME_STATE', $e->getMessage(), 409);
         }
 
         return response()->json([
             'data' => $result,
+            'meta' => ['request_id' => $this->apiRequestId()],
         ], $result['idempotent_replay'] ? 200 : 201);
     }
 }
-
